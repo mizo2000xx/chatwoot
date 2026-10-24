@@ -1,8 +1,12 @@
-# pre-build stage
-FROM node:24.22.1-alpine as node
+# syntax=docker/dockerfile:1
+# check=error=true
+
+# Make sure RUBY_VERSION matches the Ruby version in .ruby-version
+ARG RUBY_VERSION=3.4.4
+FROM node:20-alpine as node
 FROM ruby:3.4.4-alpine3.21 AS pre-builder
 
-ARG NODE_VERSION="24.22.1"
+ARG NODE_VERSION="20"
 ARG PNPM_VERSION="10.2.0"
 ENV NODE_VERSION=${NODE_VERSION}
 ENV PNPM_VERSION=${PNPM_VERSION}
@@ -98,7 +102,7 @@ RUN rm -rf /gems/ruby/3.4.0/cache/*.gem \
 # final build stage
 FROM ruby:3.4.4-alpine3.21
 
-ARG NODE_VERSION="24.22.1"
+ARG NODE_VERSION="20"
 ARG PNPM_VERSION="10.2.0"
 ENV NODE_VERSION=${NODE_VERSION}
 ENV PNPM_VERSION=${PNPM_VERSION}
