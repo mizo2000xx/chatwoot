@@ -1,155 +1,89 @@
-# pre-build stage
-FROM node:24.22.1-alpine as node
-FROM ruby:3.4.4-alpine3.21 AS pre-builder
+# syntax=docker/dockerfile:1
+# check=error=true
 
-ARG NODE_VERSION="24.22.1"
-ARG PNPM_VERSION="10.2.0"
-ENV NODE_VERSION=${NODE_VERSION}
-ENV PNPM_VERSION=${PNPM_VERSION}
+# Make sure RUBY_VERSION matches the Ruby version in .ruby-version
+ARG RUBY_VERSION=3.4.4
+FROM ruby:$RUBY_VERSION-slim AS base
 
-# ARG default to production settings
-# For development docker-compose file overrides ARGS
-ARG BUNDLE_WITHOUT="development:test"
-ENV BUNDLE_WITHOUT ${BUNDLE_WITHOUT}
-ENV BUNDLER_VERSION=2.5.16
+LABEL fly_launch_runtime="rails"
 
-ARG RAILS_SERVE_STATIC_FILES=true
-ENV RAILS_SERVE_STATIC_FILES ${RAILS_SERVE_STATIC_FILES}
+# Rails app lives here
+WORKDIR /rails
 
-ARG RAILS_ENV=production
-ENV RAILS_ENV ${RAILS_ENV}
+# Update gems and bundler
+RUN gem update --system --no-document && \
+    gem install -N bundler
 
-ARG NODE_OPTIONS="--max-old-space-size=4096 --openssl-legacy-provider"
-ENV NODE_OPTIONS ${NODE_OPTIONS}
+# Install base packages needed to install nodejs
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y curl libjemalloc2 libvips postgresql-client && \
+    rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
-ENV BUNDLE_PATH="/gems"
+# Set production environment
+ENV BUNDLE_DEPLOYMENT="1" \
+    BUNDLE_PATH="/usr/local/bundle" \
+    BUNDLE_WITHOUT="development:test" \
+    RAILS_ENV="production"
 
-RUN apk update && apk add --no-cache \
-  openssl \
-  tar \
-  build-base \
-  tzdata \
-  postgresql-dev \
-  postgresql-client \
-  git \
-  curl \
-  xz \
-  && mkdir -p /var/app \
-  && gem install bundler -v "$BUNDLER_VERSION"
+# Install Node.js
+ARG NODE_VERSION=20
+ENV PATH=/usr/local/node/bin:$PATH
+RUN curl -sL https://github.com/nodenv/node-build/archive/master.tar.gz | tar xz -C /tmp/ && \
+    /tmp/node-build-master/bin/node-build "${NODE_VERSION}" /usr/local/node && \
+    rm -rf /tmp/node-build-master
 
-COPY --from=node /usr/local/bin/node /usr/local/bin/
-COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
-RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
-  && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
-RUN npm install -g pnpm@${PNPM_VERSION}
+# Throw-away build stage to reduce size of final image
+FROM base AS build
 
-RUN echo 'export PNPM_HOME="/root/.local/share/pnpm"' >> /root/.shrc \
-  && echo 'export PATH="$PNPM_HOME:$PATH"' >> /root/.shrc \
-  && export PNPM_HOME="/root/.local/share/pnpm" \
-  && export PATH="$PNPM_HOME:$PATH" \
-  && pnpm --version
+# Install packages needed to build gems and node modules
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y build-essential libffi-dev libpq-dev libyaml-dev node-gyp pkg-config python-is-python3 && \
+    rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
-# Persist the environment variables in Docker
-ENV PNPM_HOME="/root/.local/share/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
+# Build options
+ENV PATH="/usr/local/node/bin:$PATH"
 
-WORKDIR /app
-
+# Install application gems
 COPY Gemfile Gemfile.lock ./
+RUN bundle install && \
+    rm -rf ~/.bundle/ "${BUNDLE_PATH}"/ruby/*/cache "${BUNDLE_PATH}"/ruby/*/bundler/gems/*/.git && \
+    bundle exec bootsnap precompile --gemfile
 
-# natively compile grpc and protobuf to support alpine musl (dialogflow-docker workflow)
-# https://github.com/googleapis/google-cloud-ruby/issues/13306
-# adding xz as nokogiri was failing to build libxml
-# https://github.com/chatwoot/chatwoot/issues/4045
-RUN apk update && apk add --no-cache build-base musl ruby-full ruby-dev gcc make musl-dev openssl openssl-dev g++ linux-headers xz vips
-RUN bundle config set --local force_ruby_platform true
+# Install node modules
+COPY package.json ./
+RUN npm install
 
-# Do not install development or test gems in production
-RUN if [ "$RAILS_ENV" = "production" ]; then \
-  bundle config set without 'development test'; bundle install -j 4 -r 3; \
-  else bundle install -j 4 -r 3; \
-  fi
+# Copy application code
+COPY . .
 
-COPY package.json pnpm-lock.yaml ./
-RUN pnpm i
+# Precompile bootsnap code for faster boot times
+RUN bundle exec bootsnap precompile app/ lib/
 
-COPY . /app
+# Precompiling assets for production without requiring secret RAILS_MASTER_KEY
+RUN SECRET_KEY_BASE_DUMMY=1 ./bin/rails assets:precompile
 
-# creating a log directory so that image wont fail when RAILS_LOG_TO_STDOUT is false
-# https://github.com/chatwoot/chatwoot/issues/701
-RUN mkdir -p /app/log
 
-# generate production assets if production environment
-RUN if [ "$RAILS_ENV" = "production" ]; then \
-  SECRET_KEY_BASE=precompile_placeholder RAILS_LOG_TO_STDOUT=enabled bundle exec rake assets:precompile \
-  && rm -rf spec node_modules tmp/cache; \
-  fi
+# Final stage for app image
+FROM base
 
-# Generate .git_sha file with current commit hash
-RUN git rev-parse HEAD > /app/.git_sha
+# Install packages needed for deployment
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y imagemagick libvips && \
+    rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
-# Remove unnecessary files
-RUN rm -rf /gems/ruby/3.4.0/cache/*.gem \
-  && find /gems/ruby/3.4.0/gems/ \( -name "*.c" -o -name "*.o" \) -delete \
-  && rm -rf .git \
-  && rm .gitignore
+# Copy built artifacts: gems, application
+COPY --from=build "${BUNDLE_PATH}" "${BUNDLE_PATH}"
+COPY --from=build /rails /rails
 
-# final build stage
-FROM ruby:3.4.4-alpine3.21
+# Run and own only the runtime files as a non-root user for security
+RUN groupadd --system --gid 1000 rails && \
+    useradd rails --uid 1000 --gid 1000 --create-home --shell /bin/bash && \
+    chown -R 1000:1000 db log tmp
+USER 1000:1000
 
-ARG NODE_VERSION="24.22.1"
-ARG PNPM_VERSION="10.2.0"
-ENV NODE_VERSION=${NODE_VERSION}
-ENV PNPM_VERSION=${PNPM_VERSION}
+# Entrypoint sets up the container.
+ENTRYPOINT ["/rails/bin/docker-entrypoint"]
 
-ARG BUNDLE_WITHOUT="development:test"
-ENV BUNDLE_WITHOUT ${BUNDLE_WITHOUT}
-ENV BUNDLER_VERSION=2.5.16
-
-ARG EXECJS_RUNTIME="Disabled"
-ENV EXECJS_RUNTIME ${EXECJS_RUNTIME}
-
-ARG RAILS_SERVE_STATIC_FILES=true
-ENV RAILS_SERVE_STATIC_FILES ${RAILS_SERVE_STATIC_FILES}
-
-ARG BUNDLE_FORCE_RUBY_PLATFORM=1
-ENV BUNDLE_FORCE_RUBY_PLATFORM ${BUNDLE_FORCE_RUBY_PLATFORM}
-
-ARG RAILS_ENV=production
-ENV RAILS_ENV ${RAILS_ENV}
-ENV BUNDLE_PATH="/gems"
-
-RUN apk update && apk add --no-cache \
-  build-base \
-  openssl \
-  tzdata \
-  postgresql-client \
-  imagemagick \
-  git \
-  vips \
-  && gem install bundler -v "$BUNDLER_VERSION"
-
-# Restrict libvips to its trusted image loaders when generating variants
-ENV VIPS_BLOCK_UNTRUSTED=1
-
-COPY --from=node /usr/local/bin/node /usr/local/bin/
-COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
-
-RUN if [ "$RAILS_ENV" != "production" ]; then \
-  apk add --no-cache curl \
-  && ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
-  && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
-  && npm install -g pnpm@${PNPM_VERSION} \
-  && pnpm --version; \
-  fi
-
-COPY --from=pre-builder /gems/ /gems/
-COPY --from=pre-builder /app /app
-
-# Copy .git_sha file from pre-builder stage
-COPY --from=pre-builder /app/.git_sha /app/.git_sha
-
-WORKDIR /app
-
+# Start the server by default, this can be overwritten at runtime
 EXPOSE 3000
